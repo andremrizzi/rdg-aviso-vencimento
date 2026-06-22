@@ -457,6 +457,805 @@
   }
 
   var DEFAULT_TPL_SINGLE =
+"Prezado(a) {NOME}.\n\nPassamos para lembrar o vencimento do seu boleto no valor de {VALOR}, com vencimento em {DATA}.\n\nCaso o pagamento já tenha sido realizado, favor desconsiderar este aviso.\n\nAtenciosamente,\nFinanceiro RDG Jeans\nMENSAGEM AUTOMATICA SISTEMA RDG JEANS";
+
+  var DEFAULT_TPL_MULTI =
+"Prezado(a) {NOME}.\n\nPassamos para lembrar o vencimento dos seus boletos com vencimento em {DATA}:\n\n{LISTA}\n\nTotal: {TOTAL}\n\nCaso o pagamento já tenha sido realizado, favor desconsiderar este aviso.\n\nAtenciosamente,\nFinanceiro RDG Jeans\nMENSAGEM AUTOMATICA SISTEMA RDG JEANS";
+
+  var DEFAULT_TPL_LINE = "- Vencimento {DATA}: {VALOR}";
+
+  var state = {
+    rows: [],          // valid parsed rows
+    incomplete: [],     // rows that failed validation
+    totalsLine: null,   // {valor, pago, saldo} if found in report
+    reportDate: null,
+    tplSingle: DEFAULT_TPL_SINGLE,
+    tplMulti: DEFAULT_TPL_MULTI,
+    tplLine: DEFAULT_TPL_LINE,
+    clients: []          // grouped
+  };
+
+  // ---------- parsing: workbook (array of arrays) ----------
+  function parseWorkbookToRows(aoa){
+    var rows = [];
+    var totalsLine = null;
+    var reportDate = null;
+
+    for(var i=0;i<aoa.length;i++){
+      var row = aoa[i];
+      if(!row || !row.length) continue;
+
+      // detect report header date e.g. "18/06/2026 08:00:41"
+      if(!reportDate){
+        for(var c=0;c<row.length;c++){
+          if(typeof row[c] === 'string'){
+            var m = row[c].match(/(\d{2}\/\d{2}\/\d{4})\s+\d{2}:\d{2}/);
+            if(m){ reportDate = m[1]; break; }
+          }
+        }
+      }
+
+      // detect totals line
+      var hasTotais = row.some(function(c){ return typeof c === 'string' && c.trim().toLowerCase().indexOf('totais') === 0; });
+      if(hasTotais){
+        var nums = row.filter(function(c){ return typeof c === 'number'; });
+        if(nums.length >= 3){
+          totalsLine = { valor: nums[0], pago: nums[1], saldo: nums[2] };
+        }
+        continue;
+      }
+
+      var dupIdx = -1;
+      for(var c2=0;c2<row.length;c2++){
+        if(typeof row[c2] === 'string' && row[c2].trim().toUpperCase() === 'DUPL'){ dupIdx = c2; break; }
+      }
+      if(dupIdx === -1) continue;
+
+      var leading = row.slice(0, dupIdx);
+      var trailing = row.slice(dupIdx+1);
+
+      var code = null, nameParts = [];
+      for(var li=0; li<leading.length; li++){
+        var v = leading[li];
+        if(v === null || v === undefined || v === '') continue;
+        if(code === null && typeof v === 'number'){ code = v; continue; }
+        nameParts.push(String(v));
+      }
+      var name = stripCpfPrefix(nameParts.join(' ').trim());
+
+      var duplicata = null;
+      var dates = [];
+      var numbers = [];
+      for(var ti=0; ti<trailing.length; ti++){
+        var tv = trailing[ti];
+        if(tv === null || tv === undefined || tv === '') continue;
+        if(duplicata === null && typeof tv === 'string' && !isDateStr(tv)){ duplicata = tv; continue; }
+        if(isDateStr(tv)) dates.push(tv.trim());
+        else if(typeof tv === 'number') numbers.push(tv);
+      }
+
+      rows.push({
+        code: code,
+        name: name,
+        duplicata: duplicata,
+        dataEmissao: dates[0] || null,
+        dataVencimento: dates[1] || null,
+        valor: numbers[0],
+        valorPago: numbers[1],
+        valorSaldo: numbers[2]
+      });
+    }
+    return { rows: rows, totalsLine: totalsLine, reportDate: reportDate };
+  }
+
+  // ---------- parsing: pasted text ----------
+  function parseTextToRows(text){
+    var lines = text.split(/\r?\n/);
+    var rows = [];
+    var totalsLine = null;
+    var reportDate = null;
+    var lineRegex = /^(\d{4,6})\s+(?:[\d.\/-]+\s+)?(.+?)\s+DUPL\s+([A-Za-z]?\d+-\d+-\d+)\s+(\d{2}\/\d{2}\/\d{4})\s+(\d{2}\/\d{2}\/\d{4})\s+([\d.,]+)\s+([\d.,]+)\s+([\d.,]+)\s*$/i;
+    var totalsRegex = /^totais:?\s+([\d.,]+)\s+([\d.,]+)\s+([\d.,]+)/i;
+    var dateHeaderRegex = /(\d{2}\/\d{2}\/\d{4})\s+\d{2}:\d{2}/;
+
+    lines.forEach(function(raw){
+      var line = raw.trim();
+      if(!line) return;
+      if(!reportDate){
+        var dm = line.match(dateHeaderRegex);
+        if(dm) reportDate = dm[1];
+      }
+      var tm = line.match(totalsRegex);
+      if(tm){
+        totalsLine = { valor: brToFloat(tm[1]), pago: brToFloat(tm[2]), saldo: brToFloat(tm[3]) };
+        return;
+      }
+      var m = line.match(lineRegex);
+      if(!m) return;
+      rows.push({
+        code: m[1],
+        name: stripCpfPrefix(m[2].trim()),
+        duplicata: m[3],
+        dataEmissao: m[4],
+        dataVencimento: m[5],
+        valor: brToFloat(m[6]),
+        valorPago: brToFloat(m[7]),
+        valorSaldo: brToFloat(m[8])
+      });
+    });
+    return { rows: rows, totalsLine: totalsLine, reportDate: reportDate };
+  }
+
+  // ---------- validation + grouping ----------
+  function processParsed(parsed){
+    state.incomplete = [];
+    state.rows = [];
+    state.totalsLine = parsed.totalsLine;
+    state.reportDate = parsed.reportDate;
+
+    parsed.rows.forEach(function(r){
+      var ok = r.code && r.name && r.duplicata && r.dataVencimento &&
+                isFinite(r.valor) && isFinite(r.valorPago) && isFinite(r.valorSaldo);
+      if(!ok){ state.incomplete.push(r); return; }
+      r.code = padCode(r.code);
+      r.isPartial = r.valorPago > 0.004 && r.valorSaldo > 0.004;
+      r.isAdjusted = (r.valorPago <= 0.004) && Math.abs(r.valorSaldo - r.valor) > 0.004;
+      state.rows.push(r);
+    });
+
+    // group by client code, only rows with saldo > 0
+    var map = {};
+    state.rows.filter(function(r){ return r.valorSaldo > 0.004; }).forEach(function(r){
+      if(!map[r.code]) map[r.code] = { code:r.code, name:r.name, dups:[], total:0, anyFlag:false };
+      map[r.code].dups.push(r);
+      map[r.code].total += r.valorSaldo;
+      if(r.isPartial || r.isAdjusted) map[r.code].anyFlag = true;
+    });
+    state.clients = Object.values(map).sort(function(a,b){ return a.name.localeCompare(b.name); });
+  }
+
+  // ---------- rendering ----------
+  function renderConferencia(){
+    var body = document.getElementById('confBody');
+    body.innerHTML = '';
+    state.rows.forEach(function(r){
+      var tr = document.createElement('tr');
+      var cls = r.isAdjusted ? 'bad-row' : (r.isPartial ? 'flag-row' : '');
+      if(cls) tr.className = cls;
+      var statusTag = '<span class="tag ok">ok</span>';
+      if(r.isPartial) statusTag = '<span class="tag warn">pagamento parcial</span>';
+      if(r.isAdjusted) statusTag = '<span class="tag bad">saldo difere do original</span>';
+      tr.innerHTML =
+        '<td>'+escapeHtml(r.name)+' <span style="color:var(--text-2); font-family:JetBrains Mono, monospace; font-size:11px;">#'+r.code+'</span></td>'+
+        '<td style="font-family:JetBrains Mono, monospace;">'+escapeHtml(r.duplicata)+'</td>'+
+        '<td>'+escapeHtml(r.dataVencimento)+'</td>'+
+        '<td class="num">'+formatBRL(r.valor)+'</td>'+
+        '<td class="num">'+formatBRL(r.valorPago)+'</td>'+
+        '<td class="num">'+formatBRL(r.valorSaldo)+'</td>'+
+        '<td>'+statusTag+'</td>';
+      body.appendChild(tr);
+    });
+    state.incomplete.forEach(function(r){
+      var tr = document.createElement('tr');
+      tr.className = 'bad-row';
+      tr.innerHTML = '<td colspan="7"><span class="tag bad">dado incompleto</span> &nbsp; linha não pôde ser totalmente lida: '+escapeHtml(JSON.stringify(r))+'</td>';
+      body.appendChild(tr);
+    });
+  }
+
+  function renderSummary(){
+    var validRows = state.rows.filter(function(r){ return r.valorSaldo > 0.004; });
+    var totalCalc = validRows.reduce(function(s,r){ return s + r.valorSaldo; }, 0);
+    var qtdClientes = state.clients.length;
+    var qtdTitulos = validRows.length;
+    var partialCount = validRows.filter(function(r){ return r.isPartial; }).length;
+    var adjustedCount = validRows.filter(function(r){ return r.isAdjusted; }).length;
+
+    var vencSet = {};
+    validRows.forEach(function(r){ vencSet[r.dataVencimento] = true; });
+    var vencKeys = Object.keys(vencSet);
+    var vencLabel = vencKeys.length === 1 ? vencKeys[0] : (vencKeys.length+' datas distintas');
+
+    var grid = document.getElementById('statGrid');
+    var divergent = false;
+    var divergMsg = '';
+    if(state.totalsLine){
+      var diff = Math.abs(state.totalsLine.saldo - totalCalc);
+      divergent = diff > 0.01;
+      if(divergent) divergMsg = 'Total informado no relatório: '+formatBRL(state.totalsLine.saldo)+' · diferença de '+formatBRL(diff);
+    }
+
+    grid.innerHTML =
+      statCard('Data do relatório', state.reportDate || '—') +
+      statCard('Vencimento identificado', vencLabel) +
+      statCard('Clientes', qtdClientes) +
+      statCard('Títulos em aberto', qtdTitulos) +
+      statCard('Valor total calculado', formatBRL(totalCalc), 'ok') +
+      statCard('Conferência com relatório', state.totalsLine ? (divergent ? 'Divergência' : 'OK') : 'Sem total no arquivo', divergent ? 'alert' : (state.totalsLine ? 'ok' : ''));
+
+    var alerts = [];
+    if(divergent) alerts.push({type:'bad', text:'Divergência entre o total calculado e o total informado no relatório. '+divergMsg+'. Confira antes de enviar.'});
+    if(partialCount) alerts.push({type:'warn', text: partialCount+' título(s) com pagamento parcial identificado.'});
+    if(adjustedCount) alerts.push({type:'warn', text: adjustedCount+' título(s) com saldo diferente do valor original sem pagamento registrado — vale confirmar.'});
+    if(state.incomplete.length) alerts.push({type:'bad', text: state.incomplete.length+' linha(s) com dado incompleto ou ilegível, não incluídas nas mensagens.'});
+    var multiClientCount = state.clients.filter(function(c){ return c.dups.length>1; }).length;
+    if(multiClientCount) alerts.push({type:'info', text: multiClientCount+' cliente(s) com mais de um título — mensagens agrupadas automaticamente.'});
+    if(!alerts.length) alerts.push({type:'info', text:'Nenhuma pendência identificada.'});
+
+    var alertList = document.getElementById('alertList');
+    alertList.innerHTML = alerts.map(function(a){ return '<li class="'+a.type+'">'+escapeHtml(a.text)+'</li>'; }).join('');
+  }
+
+  function statCard(label, value, extra){
+    return '<div class="stat-card '+(extra||'')+'"><div class="label">'+escapeHtml(label)+'</div><div class="value">'+escapeHtml(String(value))+'</div></div>';
+  }
+
+  function buildMessage(client){
+    // Saldo divergences (partial payment, adjusted balance) are surfaced to the
+    // finance team in the conference table and summary alerts, but are kept out
+    // of the customer-facing message — the message simply uses the saldo value.
+    if(client.dups.length === 1){
+      var d = client.dups[0];
+      return state.tplSingle
+        .replace(/{NOME}/g, client.name)
+        .replace(/{DATA}/g, d.dataVencimento)
+        .replace(/{VALOR}/g, formatBRL(d.valorSaldo))
+        .replace(/{DUPLICATA}/g, d.duplicata)
+        .replace(/{ATENCAO}/g, '');
+    }
+    var lista = client.dups.map(function(d){
+      return state.tplLine
+        .replace(/{DUPLICATA}/g, d.duplicata)
+        .replace(/{DATA}/g, d.dataVencimento)
+        .replace(/{VALOR}/g, formatBRL(d.valorSaldo));
+    }).join('\n');
+    return state.tplMulti
+      .replace(/{NOME}/g, client.name)
+      .replace(/{LISTA}/g, lista)
+      .replace(/{TOTAL}/g, formatBRL(client.total))
+      .replace(/{ATENCAO}/g, '');
+  }
+
+  function renderMessages(filterText){
+    var grid = document.getElementById('msgGrid');
+    grid.innerHTML = '';
+    var filtered = state.clients.filter(function(c){
+      return !filterText || c.name.toLowerCase().indexOf(filterText.toLowerCase()) !== -1;
+    });
+    filtered.forEach(function(client){
+      var msg = buildMessage(client);
+      var card = document.createElement('div');
+      card.className = 'msg-card';
+      var dupLabel = client.dups.length>1 ? (client.dups.length+' títulos') : '1 título';
+      card.innerHTML =
+        '<div class="stub">#'+client.code+'</div>'+
+        '<div class="name">'+escapeHtml(client.name)+'</div>'+
+        '<div class="meta">'+dupLabel+' · total '+formatBRL(client.total)+'</div>'+
+        '<pre>'+escapeHtml(msg)+'</pre>'+
+        '<div class="actions">'+
+          '<button class="ghost btn-copy">Copiar mensagem</button>'+
+          '<button class="ghost btn-wa">Abrir WhatsApp</button>'+
+          '<label class="sentlabel"><input type="checkbox" class="chk-sent"/> Enviada</label>'+
+        '</div>';
+      card.querySelector('.btn-copy').addEventListener('click', function(){
+        navigator.clipboard.writeText(msg).then(function(){
+          var b = card.querySelector('.btn-copy');
+          var old = b.textContent;
+          b.textContent = 'Copiado!';
+          setTimeout(function(){ b.textContent = old; }, 1500);
+        });
+      });
+      card.querySelector('.btn-wa').addEventListener('click', function(){
+        window.open('https://api.whatsapp.com/send?text='+encodeURIComponent(msg), '_blank');
+      });
+      card.querySelector('.chk-sent').addEventListener('change', function(e){
+        card.classList.toggle('sent', e.target.checked);
+      });
+      grid.appendChild(card);
+    });
+    document.getElementById('headerCount').innerHTML =
+      '<strong>'+state.clients.length+'</strong>clientes · '+state.rows.filter(function(r){return r.valorSaldo>0.004;}).length+' títulos';
+  }
+
+  function renderAll(){
+    document.getElementById('resultsSection').style.display = 'block';
+    renderConferencia();
+    renderSummary();
+    renderMessages('');
+    document.getElementById('errorBox').innerHTML = '';
+  }
+
+  function showError(msg){
+    document.getElementById('errorBox').innerHTML = '<div class="error-box">'+escapeHtml(msg)+'</div>';
+  }
+
+  // ---------- file handling ----------
+  function handleFile(file){
+    if(!file) return;
+    document.getElementById('fileName').textContent = file.name;
+    var reader = new FileReader();
+    reader.onload = function(e){
+      try{
+        var data = new Uint8Array(e.target.result);
+        var wb = XLSX.read(data, {type:'array'});
+        var sheet = wb.Sheets[wb.SheetNames[0]];
+        var aoa = XLSX.utils.sheet_to_json(sheet, {header:1, raw:true, defval:null});
+        var parsed = parseWorkbookToRows(aoa);
+        if(!parsed.rows.length){ showError('Não encontrei linhas de duplicata reconhecíveis nesse arquivo. Confira se é o relatório de Contas a Receber Manutenção exportado do Sisplan.'); return; }
+        processParsed(parsed);
+        renderAll();
+      }catch(err){
+        showError('Erro ao ler o arquivo: '+err.message);
+      }
+    };
+    reader.readAsArrayBuffer(file);
+  }
+
+  document.getElementById('fileInput').addEventListener('change', function(e){
+    handleFile(e.target.files[0]);
+  });
+  var dz = document.getElementById('dropzone');
+  dz.addEventListener('click', function(){ document.getElementById('fileInput').click(); });
+  dz.addEventListener('keypress', function(e){ if(e.key==='Enter') document.getElementById('fileInput').click(); });
+  dz.addEventListener('dragover', function(e){ e.preventDefault(); dz.classList.add('drag'); });
+  dz.addEventListener('dragleave', function(){ dz.classList.remove('drag'); });
+  dz.addEventListener('drop', function(e){
+    e.preventDefault(); dz.classList.remove('drag');
+    handleFile(e.dataTransfer.files[0]);
+  });
+
+  document.getElementById('parsePasteBtn').addEventListener('click', function(){
+    var text = document.getElementById('pasteArea').value;
+    if(!text.trim()){ showError('Cole o texto do relatório antes de processar.'); return; }
+    var parsed = parseTextToRows(text);
+    if(!parsed.rows.length){ showError('Não consegui reconhecer linhas no formato esperado. Verifique se o texto colado mantém o padrão: código, nome, DUPL, número da duplicata, datas e valores.'); return; }
+    processParsed(parsed);
+    renderAll();
+  });
+
+  // ---------- tabs ----------
+  document.querySelectorAll('.tab-btn').forEach(function(btn){
+    btn.addEventListener('click', function(){
+      document.querySelectorAll('.tab-btn').forEach(function(b){ b.classList.remove('active'); });
+      document.querySelectorAll('.pane').forEach(function(p){ p.classList.remove('active'); });
+      btn.classList.add('active');
+      document.getElementById('pane-'+btn.dataset.tab).classList.add('active');
+    });
+  });
+
+  // ---------- template editor ----------
+  document.getElementById('tplSingle').value = DEFAULT_TPL_SINGLE;
+  document.getElementById('tplMulti').value = DEFAULT_TPL_MULTI;
+  document.getElementById('tplLine').value = DEFAULT_TPL_LINE;
+
+  document.getElementById('applyTplBtn').addEventListener('click', function(){
+    state.tplSingle = document.getElementById('tplSingle').value || DEFAULT_TPL_SINGLE;
+    state.tplMulti = document.getElementById('tplMulti').value || DEFAULT_TPL_MULTI;
+    state.tplLine = document.getElementById('tplLine').value || DEFAULT_TPL_LINE;
+    if(state.clients.length) renderMessages(document.getElementById('filterClient').value);
+  });
+  document.getElementById('resetTplBtn').addEventListener('click', function(){
+    document.getElementById('tplSingle').value = DEFAULT_TPL_SINGLE;
+    document.getElementById('tplMulti').value = DEFAULT_TPL_MULTI;
+    document.getElementById('tplLine').value = DEFAULT_TPL_LINE;
+    state.tplSingle = DEFAULT_TPL_SINGLE; state.tplMulti = DEFAULT_TPL_MULTI; state.tplLine = DEFAULT_TPL_LINE;
+    if(state.clients.length) renderMessages(document.getElementById('filterClient').value);
+  });
+
+  // ---------- filter + copy all ----------
+  document.getElementById('filterClient').addEventListener('input', function(e){
+    renderMessages(e.target.value);
+  });
+  document.getElementById('copyAllBtn').addEventListener('click', function(){
+    var all = state.clients.map(function(c){ return buildMessage(c); }).join('\n\n----------\n\n');
+    navigator.clipboard.writeText(all).then(function(){
+      var b = document.getElementById('copyAllBtn');
+      var old = b.textContent;
+      b.textContent = 'Copiado!';
+      setTimeout(function(){ b.textContent = old; }, 1500);
+    });
+  });
+
+})();
+</script>
+</body>
+</html>    letter-spacing:-0.01em;
+  }
+  header.top p{margin:6px 0 0; color:var(--text-2); font-size:14px; max-width:480px;}
+  .badge-count{
+    font-family:'JetBrains Mono', monospace;
+    text-align:right;
+    color:var(--text-2);
+    font-size:13px;
+  }
+  .badge-count strong{
+    display:block;
+    font-family:'Space Grotesk', sans-serif;
+    font-size:28px;
+    color:var(--gold-text);
+    font-weight:600;
+  }
+
+  section{margin-bottom:40px;}
+  h2{
+    font-family:'Space Grotesk', sans-serif;
+    font-size:18px;
+    font-weight:600;
+    margin:0 0 16px;
+    display:flex;
+    align-items:center;
+    gap:10px;
+  }
+  h2 .step{
+    font-family:'JetBrains Mono', monospace;
+    font-size:12px;
+    color:#0d0f14;
+    background:var(--gold);
+    border-radius:4px;
+    width:22px; height:22px;
+    display:inline-flex; align-items:center; justify-content:center;
+  }
+
+  /* upload */
+  .tabs{display:flex; gap:8px; margin-bottom:14px;}
+  .tab-btn{
+    background:var(--surface);
+    border:1px solid var(--border);
+    color:var(--text-2);
+    padding:8px 14px;
+    border-radius:6px;
+    font-size:13px;
+    cursor:pointer;
+    font-family:'Inter';
+  }
+  .tab-btn.active{color:var(--text); border-color:var(--gold); background:var(--surface-2);}
+
+  .dropzone{
+    border:1.5px dashed var(--border);
+    border-radius:10px;
+    background:var(--surface);
+    padding:36px 20px;
+    text-align:center;
+    cursor:pointer;
+    transition:border-color .15s, background .15s;
+    box-shadow:0 1px 2px rgba(20,20,10,.04);
+  }
+  .dropzone:hover, .dropzone.drag{border-color:var(--gold); background:var(--surface-2);}
+  .dropzone p{margin:0; color:var(--text-2); font-size:14px;}
+  .dropzone p.main{color:var(--text); font-size:15px; margin-bottom:4px; font-weight:500;}
+  .dropzone input{display:none;}
+  .file-name{font-family:'JetBrains Mono', monospace; font-size:12px; color:var(--gold-text); margin-top:10px;}
+
+  textarea#pasteArea{
+    width:100%;
+    min-height:160px;
+    background:var(--surface);
+    border:1px solid var(--border);
+    color:var(--text);
+    border-radius:8px;
+    padding:14px;
+    font-family:'JetBrains Mono', monospace;
+    font-size:12px;
+    resize:vertical;
+  }
+  .pane{display:none;}
+  .pane.active{display:block;}
+
+  button.primary{
+    background:var(--gold);
+    color:#1a1300;
+    border:none;
+    border-radius:6px;
+    padding:10px 18px;
+    font-weight:600;
+    font-size:14px;
+    cursor:pointer;
+    margin-top:14px;
+  }
+  button.primary:hover{background:var(--gold-text);}
+  button.ghost{
+    background:transparent;
+    border:1px solid var(--border);
+    color:var(--text-2);
+    border-radius:6px;
+    padding:9px 14px;
+    font-size:13px;
+    cursor:pointer;
+  }
+  button.ghost:hover{border-color:var(--gold); color:var(--text);}
+
+  .error-box{
+    background:var(--danger-soft);
+    border:1px solid var(--danger);
+    color:var(--danger);
+    border-radius:8px;
+    padding:12px 14px;
+    font-size:13px;
+    margin-top:14px;
+  }
+
+  /* conference table */
+  table{width:100%; border-collapse:collapse; font-size:13px;}
+  th{
+    text-align:left;
+    font-family:'JetBrains Mono', monospace;
+    font-size:11px;
+    letter-spacing:.04em;
+    text-transform:uppercase;
+    color:var(--text-2);
+    border-bottom:1px solid var(--gold);
+    padding:8px 10px;
+  }
+  td{
+    padding:9px 10px;
+    border-bottom:1px solid var(--border);
+    font-variant-numeric:tabular-nums;
+  }
+  td.num{text-align:right; font-family:'JetBrains Mono', monospace;}
+  tr.flag-row td{background:var(--warning-soft);}
+  tr.bad-row td{background:var(--danger-soft);}
+  .tag{
+    font-family:'JetBrains Mono', monospace;
+    font-size:10px;
+    padding:2px 6px;
+    border-radius:4px;
+    white-space:nowrap;
+  }
+  .tag.warn{background:var(--warning-soft); color:var(--warning);}
+  .tag.bad{background:var(--danger-soft); color:var(--danger);}
+  .tag.ok{background:var(--ok-soft); color:var(--ok);}
+
+  /* summary cards */
+  .stat-grid{
+    display:grid;
+    grid-template-columns:repeat(auto-fit, minmax(150px,1fr));
+    gap:12px;
+    margin-bottom:18px;
+  }
+  .stat-card{
+    background:var(--surface);
+    border:1px solid var(--border);
+    border-radius:8px;
+    padding:14px 16px;
+    box-shadow:0 1px 2px rgba(20,20,10,.04);
+  }
+  .stat-card .label{font-size:11px; color:var(--text-2); text-transform:uppercase; letter-spacing:.05em; font-family:'JetBrains Mono', monospace;}
+  .stat-card .value{font-family:'Space Grotesk', sans-serif; font-size:22px; font-weight:600; margin-top:4px;}
+  .stat-card.alert .value{color:var(--danger);}
+  .stat-card.ok .value{color:var(--ok);}
+
+  .alert-list{list-style:none; margin:0; padding:0; display:flex; flex-direction:column; gap:8px;}
+  .alert-list li{
+    border-radius:6px;
+    padding:10px 12px;
+    font-size:13px;
+    border-left:3px solid var(--border);
+    background:var(--surface);
+    box-shadow:0 1px 2px rgba(20,20,10,.04);
+  }
+  .alert-list li.warn{border-left-color:var(--warning); color:var(--warning);}
+  .alert-list li.bad{border-left-color:var(--danger); color:var(--danger);}
+  .alert-list li.info{border-left-color:var(--text-2); color:var(--text-2);}
+
+  /* template editor */
+  details.template-editor{
+    background:var(--surface);
+    border:1px solid var(--border);
+    border-radius:8px;
+    padding:0 16px;
+    margin-bottom:18px;
+  }
+  details.template-editor summary{
+    cursor:pointer; padding:14px 0; font-size:13px; color:var(--text-2); font-family:'JetBrains Mono', monospace;
+  }
+  details.template-editor textarea{
+    width:100%;
+    background:var(--surface-2);
+    border:1px solid var(--border);
+    color:var(--text);
+    border-radius:6px;
+    padding:10px;
+    font-family:'JetBrains Mono', monospace;
+    font-size:12px;
+    margin-bottom:10px;
+    min-height:90px;
+  }
+  details.template-editor label{font-size:12px; color:var(--text-2); display:block; margin-bottom:4px;}
+  .tokens-hint{font-size:11px; color:var(--text-2); margin-top:-2px; margin-bottom:14px;}
+  .tokens-hint code{color:var(--gold-text);}
+
+  .msg-toolbar{display:flex; justify-content:space-between; align-items:center; margin-bottom:14px; gap:10px; flex-wrap:wrap;}
+  input#filterClient{
+    background:var(--surface);
+    border:1px solid var(--border);
+    color:var(--text);
+    border-radius:6px;
+    padding:8px 12px;
+    font-size:13px;
+    min-width:220px;
+  }
+
+  .msg-grid{display:grid; gap:14px;}
+  .msg-card{
+    background:var(--surface);
+    border:1px solid var(--border);
+    border-top:3px dashed var(--border);
+    border-radius:0 8px 8px 8px;
+    padding:16px 18px;
+    position:relative;
+    transition:opacity .15s;
+    box-shadow:0 1px 2px rgba(20,20,10,.04);
+  }
+  .msg-card .stub{
+    position:absolute; top:-1px; left:-1px;
+    background:var(--gold);
+    color:#1a1300;
+    font-family:'JetBrains Mono', monospace;
+    font-size:11px;
+    font-weight:600;
+    padding:3px 8px;
+    border-radius:0 0 6px 0;
+  }
+  .msg-card.sent{opacity:.4;}
+  .msg-card .name{font-family:'Space Grotesk', sans-serif; font-weight:600; font-size:15px; margin:6px 0 2px 0;}
+  .msg-card .meta{font-size:12px; color:var(--text-2); margin-bottom:10px; font-family:'JetBrains Mono', monospace;}
+  .msg-card pre{
+    white-space:pre-wrap;
+    font-family:'Inter';
+    font-size:13.5px;
+    background:var(--surface-2);
+    border:1px solid var(--border);
+    border-radius:6px;
+    padding:12px 14px;
+    margin:0 0 12px;
+  }
+  .msg-card .actions{display:flex; gap:8px; align-items:center; flex-wrap:wrap;}
+  .msg-card label.sentlabel{font-size:12px; color:var(--text-2); display:flex; align-items:center; gap:6px; margin-left:auto;}
+
+  footer{
+    text-align:center;
+    color:var(--text-2);
+    font-size:12px;
+    margin-top:60px;
+    border-top:1px solid var(--border);
+    padding-top:20px;
+  }
+
+  @media (prefers-reduced-motion: reduce){ *{transition:none !important;} }
+  @media (max-width:640px){
+    .wrap{padding:24px 16px 60px;}
+    header.top h1{font-size:24px;}
+  }
+
+  button:focus-visible, input:focus-visible, textarea:focus-visible, .dropzone:focus-visible{
+    outline:2px solid var(--gold); outline-offset:2px;
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header class="top">
+    <div>
+      <p class="eyebrow">Financeiro · RDG Jeans</p>
+      <h1>Avisos de Vencimento</h1>
+      <p>Transforma o relatório de contas a receber em mensagens prontas para WhatsApp. Roda inteiramente no seu navegador — nada é enviado a nenhum servidor.</p>
+    </div>
+    <div class="badge-count" id="headerCount"></div>
+  </header>
+
+  <section id="uploadSection">
+    <h2><span class="step">1</span>Carregar relatório</h2>
+    <div class="tabs">
+      <button class="tab-btn active" data-tab="file">Arquivo Excel / CSV</button>
+      <button class="tab-btn" data-tab="paste">Colar texto (ex: copiado do PDF)</button>
+    </div>
+
+    <div class="pane active" id="pane-file">
+      <div class="dropzone" id="dropzone" tabindex="0">
+        <p class="main">Arraste o arquivo aqui ou clique para selecionar</p>
+        <p>.xlsx, .xls ou .csv exportado do Sisplan</p>
+        <input type="file" id="fileInput" accept=".xlsx,.xls,.csv" />
+        <div class="file-name" id="fileName"></div>
+      </div>
+    </div>
+
+    <div class="pane" id="pane-paste">
+      <textarea id="pasteArea" placeholder="Cole aqui as linhas do relatório, no formato:&#10;03453 19.727.862 MICHELE BISOGNIN ARGENTA DE OLIVEIRA DUPL A043806-2-5 17/03/2026 18/06/2026 788,25 0,00 788,25"></textarea>
+      <button class="primary" id="parsePasteBtn">Processar texto</button>
+    </div>
+
+    <div id="errorBox"></div>
+  </section>
+
+  <section id="resultsSection" style="display:none;">
+
+    <div id="confSection">
+      <h2><span class="step">2</span>Tabela de conferência</h2>
+      <div style="overflow-x:auto;">
+        <table>
+          <thead>
+            <tr><th>Cliente</th><th>Duplicata</th><th>Vencimento</th><th class="num">Valor original</th><th class="num">Valor pago</th><th class="num">Saldo em aberto</th><th>Status</th></tr>
+          </thead>
+          <tbody id="confBody"></tbody>
+        </table>
+      </div>
+    </div>
+
+    <div id="summarySection">
+      <h2><span class="step">3</span>Resumo</h2>
+      <div class="stat-grid" id="statGrid"></div>
+      <ul class="alert-list" id="alertList"></ul>
+    </div>
+
+    <div id="msgSection">
+      <h2><span class="step">4</span>Mensagens prontas</h2>
+
+      <details class="template-editor">
+        <summary>Personalizar modelo de mensagem</summary>
+        <label>Modelo — cliente com 1 título</label>
+        <textarea id="tplSingle"></textarea>
+        <div class="tokens-hint">Tokens disponíveis: <code>{NOME}</code> <code>{DATA}</code> <code>{VALOR}</code> — <code>{ATENCAO}</code> fica sempre em branco (pagamento parcial / saldo ajustado ficam só na conferência interna, não vão pro cliente) — <code>{DUPLICATA}</code> também disponível, se quiser incluir.</div>
+
+        <label>Modelo — cliente com mais de 1 título</label>
+        <textarea id="tplMulti"></textarea>
+        <div class="tokens-hint">Tokens disponíveis: <code>{NOME}</code> <code>{LISTA}</code> <code>{TOTAL}</code> — <code>{ATENCAO}</code> fica sempre em branco</div>
+
+        <label>Modelo de cada linha dentro de {LISTA}</label>
+        <textarea id="tplLine" style="min-height:50px;"></textarea>
+        <div class="tokens-hint">Tokens disponíveis: <code>{DATA}</code> <code>{VALOR}</code> — <code>{DUPLICATA}</code> também disponível, se quiser incluir.</div>
+
+        <button class="ghost" id="applyTplBtn">Aplicar modelo</button>
+        <button class="ghost" id="resetTplBtn">Restaurar padrão</button>
+      </details>
+
+      <div class="msg-toolbar">
+        <input type="text" id="filterClient" placeholder="Filtrar por nome do cliente..." />
+        <button class="ghost" id="copyAllBtn">Copiar todas as mensagens</button>
+      </div>
+
+      <div class="msg-grid" id="msgGrid"></div>
+    </div>
+
+  </section>
+
+  <footer>Ferramenta interna RDG Jeans — processamento local, sem envio automático.</footer>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<script>
+(function(){
+
+  // ---------- helpers ----------
+  function brToFloat(s){
+    if(typeof s === 'number') return s;
+    if(!s) return NaN;
+    s = String(s).trim().replace(/\./g,'').replace(',', '.');
+    return parseFloat(s);
+  }
+  function formatBRL(n){
+    if(!isFinite(n)) return '—';
+    return 'R$ ' + n.toLocaleString('pt-BR', {minimumFractionDigits:2, maximumFractionDigits:2});
+  }
+  function stripCpfPrefix(name){
+    var n = String(name||'').replace(/^[\d.\/-]+\s+/, '');
+    n = n.replace(/\s+[\d.\/-]{8,}$/, ''); // remove trailing CPF/CNPJ digits glued to the name
+    return n.trim();
+  }
+  function padCode(code){
+    var s = String(code).replace(/\D/g,'');
+    return s.padStart(5,'0');
+  }
+  function isDateStr(v){
+    return typeof v === 'string' && /^\d{2}\/\d{2}\/\d{4}$/.test(v.trim());
+  }
+  function escapeHtml(s){
+    return String(s).replace(/[&<>"']/g, function(c){
+      return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];
+    });
+  }
+
+  var DEFAULT_TPL_SINGLE =
 "Olá, {NOME}.\n\nPassamos para lembrar que consta um título em aberto com vencimento em {DATA}, no valor de {VALOR}.\n\nCaso o pagamento já tenha sido realizado, favor desconsiderar esta mensagem.{ATENCAO}\n\nFinanceiro RDG Jeans\nMENSAGEM AUTOMATICA SISTEMA RDG JEANS";
 
   var DEFAULT_TPL_MULTI =
